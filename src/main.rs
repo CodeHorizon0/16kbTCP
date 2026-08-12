@@ -1,4 +1,5 @@
-// main.rs Example usage
+// main.rs
+
 use std::time::Duration;
 
 use anyhow::Result;
@@ -20,13 +21,7 @@ async fn main() -> Result<()> {
             let (stream, addr) = listener.accept().await.unwrap();
             info!("Connection from {}", addr);
             tokio::spawn(async move {
-                let config = ProtocolConfig {
-                    retry_config: RetryConfig {
-                        max_retries: 3,
-                        timeout: Duration::from_secs(5),
-                    },
-                    ..Default::default()
-                };
+                let config = ProtocolConfig::default();
                 let mut protocol = Protocol::new(stream).await.with_config(config);
                 loop {
                     match protocol.receive_message().await {
@@ -55,20 +50,14 @@ async fn main() -> Result<()> {
 
     info!("Client connecting...");
     let stream = tokio::net::TcpStream::connect("127.0.0.1:8080").await?;
-    let config = ProtocolConfig {
-        retry_config: RetryConfig {
-            max_retries: 3,
-            timeout: Duration::from_secs(5),
-        },
-        ..Default::default()
-    };
+    let config = ProtocolConfig::default();
     let mut client = Protocol::new(stream).await.with_config(config);
 
     let large_data = vec![b'X'; 30_000];
     info!("Client: sending {} bytes with compression enabled", large_data.len());
 
     client.send_message(&large_data, true).await?;
-    info!("Client: message sent and acknowledged");
+    info!("Client: message sent");
 
     let response = client.receive_message().await?;
     info!("Client: received response of {} bytes", response.len());
