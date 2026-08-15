@@ -1,5 +1,3 @@
-// src/lib.rs
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,10 +56,14 @@ impl FragmentHeader {
     }
 
     pub fn decode(buf: &[u8; HEADER_SIZE]) -> Result<Self> {
-        let magic = u16::from_be_bytes([buf[0], buf[1]]);
         let expected = get_magic();
+        let magic = u16::from_be_bytes([buf[0], buf[1]]);
         if magic != expected {
-            bail!("Invalid magic number: {:#x} (expected {:#x})", magic, expected);
+            bail!(
+                "Invalid magic number: {:#x} (expected {:#x})",
+                magic,
+                expected
+            );
         }
         Ok(Self {
             magic,
@@ -88,9 +90,12 @@ struct MessageAssembler {
 }
 
 impl MessageAssembler {
-    fn new(message_id: u64, total_fragments: u16, compressed: bool) -> Self {
+    fn new(message_id: u64, total_fragments: u16, compressed: bool) -> Result<Self> {
+        if total_fragments == 0 {
+            bail!("Total fragments must be > 0");
+        }
         let cap = total_fragments as usize;
-        Self {
+        Ok(Self {
             message_id,
             total_fragments,
             fragments: vec![Vec::new(); cap],
@@ -98,13 +103,45 @@ impl MessageAssembler {
             received_count: 0,
             compressed,
             created_at: Instant::now(),
-        }
+        })
     }
 
-    fn add_fragment(&mut self, index: u16, data: Vec<u8>) -> bool {
+    fn add_fragment(
+        &mut self,
+        index: u16,
+        data: Vec<u8>,
+        total_fragments: u16,
+        compressed: bool,
+    ) -> Result<bool> {
+        if total_fragments != self.total_fragments {
+            bail!(
+                "Fragment total_fragments mismatch: expected {}, got {}",
+                self.total_fragments,
+                total_fragments
+            );
+        }
+        if compressed != self.compressed {
+            bail!(
+                "Fragment compression flag mismatch: expected {}, got {}",
+                self.compressed,
+                compressed
+            );
+        }
+
         let idx = index as usize;
-        if idx >= self.fragments.len() || self.received[idx] {
-            return false;
+        if idx >= self.fragments.len() {
+            bail!(
+                "Fragment index {} out of range (total_fragments={})",
+                index,
+                self.total_fragments
+            );
+        }
+        if self.received[idx] {
+            debug!(
+                "Duplicate fragment {} for message {}, ignoring",
+                index, self.message_id
+            );
+            return Ok(false);
         }
         self.fragments[idx] = data;
         self.received[idx] = true;
@@ -117,7 +154,7 @@ impl MessageAssembler {
             self.received_count,
             self.total_fragments
         );
-        self.received_count == self.total_fragments as usize
+        Ok(self.received_count == self.total_fragments as usize)
     }
 
     fn assemble(self, max_message_size: usize) -> Result<Vec<u8>> {
@@ -240,7 +277,8 @@ impl Protocol {
     }
 
     fn cleanup(&mut self) {
-        let to_remove: Vec<u64> = self.assemblers
+        let to_remove: Vec<u64> = self
+            .assemblers
             .iter()
             .filter_map(|(id, assembler)| {
                 if assembler.is_expired(self.config.assembler_timeout) {
@@ -255,7 +293,8 @@ impl Protocol {
             warn!("Assembler for message {} removed by timeout", id);
         }
 
-        let to_remove_completed: Vec<u64> = self.completed
+        let to_remove_completed: Vec<u64> = self
+            .completed
             .iter()
             .filter_map(|(id, &time)| {
                 if time.elapsed() > self.config.completed_timeout {
@@ -271,7 +310,8 @@ impl Protocol {
         }
 
         if self.assemblers.len() > self.config.max_assemblers {
-            let mut entries: Vec<_> = self.assemblers
+            let mut entries: Vec<_> = self
+                .assemblers
                 .iter()
                 .map(|(id, a)| (*id, a.created_at))
                 .collect();
@@ -284,7 +324,8 @@ impl Protocol {
         }
 
         if self.completed.len() > self.config.max_completed {
-            let mut entries: Vec<_> = self.completed
+            let mut entries: Vec<_> = self
+                .completed
                 .iter()
                 .map(|(id, &t)| (*id, t))
                 .collect();
@@ -418,6 +459,10 @@ impl Protocol {
             self.read_exact_timeout(&mut header_buf).await?;
             let header = FragmentHeader::decode(&header_buf)?;
 
+            if header.total_fragments == 0 {
+                bail!("Invalid total_fragments = 0");
+            }
+
             if header.payload_len as usize > MAX_PAYLOAD_SIZE {
                 bail!("Payload too large: {} > {}", header.payload_len, MAX_PAYLOAD_SIZE);
             }
@@ -452,29 +497,42 @@ impl Protocol {
                 );
             }
 
-            let assembler = self.assemblers.entry(msg_id).or_insert_with(|| {
-                info!(
-                    "Created assembler for message {} ({} fragments)",
-                    msg_id,
-                    header.total_fragments
-                );
-                MessageAssembler::new(msg_id, header.total_fragments, compressed)
-            });
+            let assembler_entry = self.assemblers.entry(msg_id);
+            let complete = match assembler_entry {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let assembler = entry.get_mut();
+                    match assembler.add_fragment(
+                        header.fragment_index,
+                        payload,
+                        header.total_fragments,
+                        compressed,
+                    ) {
+                        Ok(complete) => complete,
+                        Err(e) => {
+                            entry.remove();
+                            bail!("Fragment error for message {}: {}", msg_id, e);
+                        }
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let mut assembler = MessageAssembler::new(msg_id, header.total_fragments, compressed)?;
+                    let complete = assembler.add_fragment(
+                        header.fragment_index,
+                        payload,
+                        header.total_fragments,
+                        compressed,
+                    )?;
+                    entry.insert(assembler);
+                    complete
+                }
+            };
 
-            if assembler.is_expired(self.config.assembler_timeout) {
-                self.assemblers.remove(&msg_id);
-                bail!(
-                    "Assembly timeout for message {} ({} sec)",
-                    msg_id,
-                    self.config.assembler_timeout.as_secs()
-                );
-            }
-
-            let complete = assembler.add_fragment(header.fragment_index, payload);
             if complete {
-                let assembled = self.assemblers.remove(&msg_id)
-                    .ok_or_else(|| anyhow!("Assembler disappeared"))?
-                    .assemble(self.config.max_message_size + 4)?;
+                let assembler = self
+                    .assemblers
+                    .remove(&msg_id)
+                    .ok_or_else(|| anyhow!("Assembler disappeared"))?;
+                let assembled = assembler.assemble(self.config.max_message_size + 4)?;
                 self.completed.insert(msg_id, Instant::now());
                 info!("Message {} fully assembled", msg_id);
 
@@ -482,7 +540,12 @@ impl Protocol {
                     bail!("Assembled message too short (missing CRC)");
                 }
                 let crc_bytes = &assembled[0..4];
-                let expected_crc = u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+                let expected_crc = u32::from_be_bytes([
+                    crc_bytes[0],
+                    crc_bytes[1],
+                    crc_bytes[2],
+                    crc_bytes[3],
+                ]);
                 let data = &assembled[4..];
                 let actual_crc = crc32fast::hash(data);
                 if actual_crc != expected_crc {
