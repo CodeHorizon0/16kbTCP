@@ -1,5 +1,3 @@
-// main.rs
-
 use std::time::Duration;
 
 use anyhow::Result;
@@ -73,7 +71,7 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!("Data mismatch"));
     }
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
     server_handle.abort();
+    let _ = server_handle.await;
     Ok(())
 }
