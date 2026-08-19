@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,10 +26,10 @@ const DEFAULT_MAX_ASSEMBLERS: usize = 1000;
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_COMPLETED_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_COMPLETED: usize = 1000;
+const PROTOCOL_MAGIC: u16 = 0xDEAD;
 
 fn get_magic() -> u16 {
-    static MAGIC: OnceLock<u16> = OnceLock::new();
-    *MAGIC.get_or_init(|| rand::random::<u16>() | 1)
+    PROTOCOL_MAGIC
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -82,11 +81,11 @@ impl FragmentHeader {
 struct MessageAssembler {
     message_id: u64,
     total_fragments: u16,
-    fragments: Vec<Vec<u8>>,
-    received: Vec<bool>,
+    fragments: Vec<Option<Vec<u8>>>,
     received_count: usize,
     compressed: bool,
     created_at: Instant,
+    accumulated_size: usize,
 }
 
 impl MessageAssembler {
@@ -98,11 +97,11 @@ impl MessageAssembler {
         Ok(Self {
             message_id,
             total_fragments,
-            fragments: vec![Vec::new(); cap],
-            received: vec![false; cap],
+            fragments: vec![None; cap],
             received_count: 0,
             compressed,
             created_at: Instant::now(),
+            accumulated_size: 0,
         })
     }
 
@@ -112,6 +111,7 @@ impl MessageAssembler {
         data: Vec<u8>,
         total_fragments: u16,
         compressed: bool,
+        max_message_size: usize,
     ) -> Result<bool> {
         if total_fragments != self.total_fragments {
             bail!(
@@ -136,16 +136,26 @@ impl MessageAssembler {
                 self.total_fragments
             );
         }
-        if self.received[idx] {
+        if self.fragments[idx].is_some() {
             debug!(
                 "Duplicate fragment {} for message {}, ignoring",
                 index, self.message_id
             );
             return Ok(false);
         }
-        self.fragments[idx] = data;
-        self.received[idx] = true;
+
+        if self.accumulated_size + data.len() > max_message_size {
+            bail!(
+                "Accumulated fragment size {} + {} exceeds limit {}",
+                self.accumulated_size,
+                data.len(),
+                max_message_size
+            );
+        }
+
+        self.fragments[idx] = Some(data);
         self.received_count += 1;
+        self.accumulated_size += self.fragments[idx].as_ref().unwrap().len();
         debug!(
             "Message {}: got fragment {}/{}, total {}/{}",
             self.message_id,
@@ -167,7 +177,7 @@ impl MessageAssembler {
             );
         }
 
-        let total_len: usize = self.fragments.iter().map(|v| v.len()).sum();
+        let total_len: usize = self.fragments.iter().map(|opt| opt.as_ref().map_or(0, |v| v.len())).sum();
         if total_len > max_message_size {
             bail!(
                 "Assembled message {} size {} exceeds limit {}",
@@ -178,8 +188,10 @@ impl MessageAssembler {
         }
 
         let mut full_data = Vec::with_capacity(total_len);
-        for frag in self.fragments {
-            full_data.extend_from_slice(&frag);
+        for opt in self.fragments {
+            if let Some(frag) = opt {
+                full_data.extend_from_slice(&frag);
+            }
         }
 
         info!(
@@ -277,61 +289,45 @@ impl Protocol {
     }
 
     fn cleanup(&mut self) {
-        let to_remove: Vec<u64> = self
-            .assemblers
-            .iter()
-            .filter_map(|(id, assembler)| {
-                if assembler.is_expired(self.config.assembler_timeout) {
-                    Some(*id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for id in to_remove {
-            self.assemblers.remove(&id);
-            warn!("Assembler for message {} removed by timeout", id);
-        }
+        self.assemblers.retain(|&id, assembler| {
+            if assembler.is_expired(self.config.assembler_timeout) {
+                warn!("Assembler for message {} removed by timeout", id);
+                false
+            } else {
+                true
+            }
+        });
 
-        let to_remove_completed: Vec<u64> = self
-            .completed
-            .iter()
-            .filter_map(|(id, &time)| {
-                if time.elapsed() > self.config.completed_timeout {
-                    Some(*id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for id in to_remove_completed {
-            self.completed.remove(&id);
-            debug!("Completed entry for message {} removed by timeout", id);
-        }
+        self.completed.retain(|&id, time| {
+            if time.elapsed() > self.config.completed_timeout {
+                debug!("Completed entry for message {} removed by timeout", id);
+                false
+            } else {
+                true
+            }
+        });
 
         if self.assemblers.len() > self.config.max_assemblers {
-            let mut entries: Vec<_> = self
-                .assemblers
+            let mut entries: Vec<_> = self.assemblers
                 .iter()
                 .map(|(id, a)| (*id, a.created_at))
                 .collect();
             entries.sort_by_key(|(_, t)| *t);
-            let to_remove_count = entries.len() - self.config.max_assemblers;
-            for (id, _) in entries.into_iter().take(to_remove_count) {
+            let to_remove = entries.len() - self.config.max_assemblers;
+            for (id, _) in entries.into_iter().take(to_remove) {
                 self.assemblers.remove(&id);
                 warn!("Assembler for message {} removed due to limit", id);
             }
         }
 
         if self.completed.len() > self.config.max_completed {
-            let mut entries: Vec<_> = self
-                .completed
+            let mut entries: Vec<_> = self.completed
                 .iter()
                 .map(|(id, &t)| (*id, t))
                 .collect();
             entries.sort_by_key(|(_, t)| *t);
-            let to_remove_count = entries.len() - self.config.max_completed;
-            for (id, _) in entries.into_iter().take(to_remove_count) {
+            let to_remove = entries.len() - self.config.max_completed;
+            for (id, _) in entries.into_iter().take(to_remove) {
                 self.completed.remove(&id);
                 debug!("Completed entry for message {} removed due to limit", id);
             }
@@ -506,6 +502,7 @@ impl Protocol {
                         payload,
                         header.total_fragments,
                         compressed,
+                        self.config.max_message_size + 4,
                     ) {
                         Ok(complete) => complete,
                         Err(e) => {
@@ -521,6 +518,7 @@ impl Protocol {
                         payload,
                         header.total_fragments,
                         compressed,
+                        self.config.max_message_size + 4,
                     )?;
                     entry.insert(assembler);
                     complete
